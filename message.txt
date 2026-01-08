@@ -1,0 +1,301 @@
+import re
+import pandas as pd
+import numpy as np
+
+# 1) 언어별 키워드 사전
+# - phrases: 문장/구문(부분일치 OK)
+# - words: 단어성 키워드(라틴권은 단어경계 \b 적용)
+# - neg: 부정 구문(걸리면 good=0으로 처리)
+# - boundary: words에 \b를 붙일지 여부 (중국어/일본어/태국어/한국어는 보통 False)
+LEXICON = {
+    # English
+    "english": {
+        "phrases": [
+            r"highly recommend(?:ed)?",
+            r"definitely recommend",
+            r"worth (?:buying|it|the money|the time)",
+            r"great game",
+            r"amazing game",
+            r"awesome game",
+            r"best game(?:s)?",
+        ],
+        "words": [
+            r"awesome", r"amazing", r"great", r"excellent", r"fantastic", r"incredible",
+            r"masterpiece", r"perfect", r"love", r"fun", r"enjoy", r"recommend", r"worth",
+        ],
+        "neg": [
+            r"not\s+good", r"not\s+great", r"not\s+worth",
+            r"(?:do\s*not|don't|dont)\s+recommend",
+            r"(?:do\s*not|don't|dont)\s+buy",
+            r"can't\s+recommend|cant\s+recommend",
+            r"avoid\b", r"refund\b",
+        ],
+        "boundary": True,
+    },
+
+    # Spanish (Spain) + LatAm는 같이 처리
+    "spanish": {
+        "phrases": [r"muy bueno", r"vale la pena", r"lo recomiendo", r"recomendad[oa]"],
+        "words": [r"genial", r"excelente", r"buen[oa]", r"incre[ií]ble", r"recomiendo", r"recomendar"],
+        "neg": [r"no\s+recomiendo", r"no\s+vale\s+la\s+pena", r"no\s+es\s+buen[oa]", r"no\s+merece\s+la\s+pena", r"no\s+compr(?:es|ar)"],
+        "boundary": True,
+    },
+    "latam": {  # 라틴아메리카 스페인어
+        "phrases": [r"muy bueno", r"vale la pena", r"lo recomiendo", r"recomendad[oa]"],
+        "words": [r"genial", r"excelente", r"buen[oa]", r"incre[ií]ble", r"recomiendo", r"recomendar"],
+        "neg": [r"no\s+recomiendo", r"no\s+vale\s+la\s+pena", r"no\s+es\s+buen[oa]", r"no\s+merece\s+la\s+pena", r"no\s+compr(?:es|ar)"],
+        "boundary": True,
+    },
+
+    # Portuguese (PT / BR)
+    "portuguese": {
+        "phrases": [r"vale a pena", r"recomendo", r"muito bom", r"jogo (?:muito )?bom"],
+        "words": [r"ótimo", r"excelente", r"incr[ií]vel", r"perfeito", r"divertido", r"recomendar"],
+        "neg": [r"não\s+recomendo", r"nao\s+recomendo", r"não\s+vale\s+a\s+pena", r"nao\s+vale\s+a\s+pena", r"não\s+é\s+bom", r"nao\s+e\s+bom", r"não\s+compr(?:e|ar)", r"nao\s+compr(?:e|ar)"],
+        "boundary": True,
+    },
+    "brazilian": {  # 브라질 포르투갈어
+        "phrases": [r"vale a pena", r"recomendo", r"muito bom", r"jogo (?:muito )?bom"],
+        "words": [r"ótimo", r"excelente", r"incr[ií]vel", r"perfeito", r"divertido", r"recomendar"],
+        "neg": [r"não\s+recomendo", r"nao\s+recomendo", r"não\s+vale\s+a\s+pena", r"nao\s+vale\s+a\s+pena", r"não\s+é\s+bom", r"nao\s+e\s+bom", r"não\s+compr(?:e|ar)", r"nao\s+compr(?:e|ar)"],
+        "boundary": True,
+    },
+
+    # German
+    "german": {
+        "phrases": [r"sehr gut", r"klare(?:s)? empfehlung", r"lohnt sich", r"absolut empfehl"],
+        "words": [r"genial", r"toll", r"super", r"großartig", r"exzellent", r"empfehle", r"empfehlenswert"],
+        "neg": [r"nicht\s+empfehl", r"lohnt\s+sich\s+nicht", r"nicht\s+gut", r"kau(?:f|ft)\s+nicht", r"kein\s+kauf"],
+        "boundary": True,
+    },
+
+    # French
+    "french": {
+        "phrases": [r"je recommande", r"vaut le coup", r"tr[eè]s bon", r"excellent jeu"],
+        "words": [r"g[eé]nial", r"excellent", r"super", r"incroyable", r"parfait", r"recommande"],
+        "neg": [r"je\s+ne\s+recommande\s+pas", r"ne\s+vaut\s+pas\s+le\s+coup", r"pas\s+bon", r"n['’]achetez\s+pas", r"n['’]ach[eè]te\s+pas"],
+        "boundary": True,
+    },
+
+    # Italian
+    "italian": {
+        "phrases": [r"lo consiglio", r"vale la pena", r"molto bello", r"gioco (?:molto )?bello"],
+        "words": [r"fantastico", r"ottimo", r"eccellente", r"stupendo", r"divertente", r"consiglio", r"consigliare"],
+        "neg": [r"non\s+lo\s+consiglio", r"non\s+vale\s+la\s+pena", r"non\s+[eè]\s+bello", r"non\s+compr(?:are|atelo)"],
+        "boundary": True,
+    },
+
+    # Dutch
+    "dutch": {
+        "phrases": [r"zeker aanraden", r"de moeite waard", r"heel goed", r"geweldig spel"],
+        "words": [r"geweldig", r"fantastisch", r"super", r"leuk", r"aanraden", r"aanbevelen", r"waarde"],
+        "neg": [r"niet\s+aanrad", r"niet\s+de\s+moeite\s+waard", r"niet\s+goed", r"koop\s+niet"],
+        "boundary": True,
+    },
+
+    # Swedish / Norwegian / Danish / Finnish
+    "swedish": {
+        "phrases": [r"rekommenderar", r"värt det", r"jättebra", r"riktigt bra"],
+        "words": [r"fantastisk", r"grym", r"suverän", r"toppen", r"kul", r"rekommendera", r"värd"],
+        "neg": [r"rekommenderar\s+inte", r"inte\s+värt", r"inte\s+bra", r"köp\s+inte"],
+        "boundary": True,
+    },
+    "norwegian": {
+        "phrases": [r"anbefaler", r"verdt det", r"kjempebra", r"veldig bra"],
+        "words": [r"fantastisk", r"råbra", r"suveren", r"gøy", r"anbefale", r"verdt"],
+        "neg": [r"anbefaler\s+ikke", r"ikke\s+verdt", r"ikke\s+bra", r"ikke\s+kjøp"],
+        "boundary": True,
+    },
+    "danish": {
+        "phrases": [r"anbefaler", r"v[æa]rd at", r"mega god", r"rigtig god"],
+        "words": [r"fantastisk", r"fremragende", r"super", r"sjov", r"anbefale", r"v[æa]rd"],
+        "neg": [r"anbefaler\s+ikke", r"ikke\s+v[æa]rd", r"ikke\s+god", r"k[oø]b\s+ikke"],
+        "boundary": True,
+    },
+    "finnish": {
+        "phrases": [r"suosittelen", r"todella hyv[äa]", r"sen arvoinen", r"hyv[äa] peli"],
+        "words": [r"loistava", r"mahtava", r"erinomainen", r"hauska", r"suositella", r"arvoinen"],
+        "neg": [r"en\s+suosittele", r"ei\s+kannata", r"ei\s+hyv[äa]", r"älä\s+osta"],
+        "boundary": True,
+    },
+
+    # Polish / Czech / Romanian / Hungarian / Bulgarian / Greek / Ukrainian / Russian / Turkish
+    "polish": {
+        "phrases": [r"polecam", r"warto", r"świetna gra", r"bardzo dobra"],
+        "words": [r"świetn[aey]", r"super", r"rewelacyjna", r"doskonała", r"polecić", r"warto"],
+        "neg": [r"nie\s+polecam", r"nie\s+warto", r"nie\s+jest\s+dobr", r"nie\s+kupuj"],
+        "boundary": True,
+    },
+    "czech": {
+        "phrases": [r"doporu[čc]uji", r"stoj[ií]\s+za\s+to", r"skv[ěe]l[aá]", r"v[ýy]born[aá]"],
+        "words": [r"super", r"skv[ěe]l", r"v[ýy]born", r"bav[ií]", r"doporu[čc]it"],
+        "neg": [r"nedoporu[čc]uji", r"nestoj[ií]\s+za\s+to", r"nen[ií]\s+dobr", r"nekupuj"],
+        "boundary": True,
+    },
+    "romanian": {
+        "phrases": [r"recomand", r"merit[ăa]", r"foarte bun", r"joc (?:foarte )?bun"],
+        "words": [r"excelent", r"minunat", r"super", r"recomanda", r"merit"],
+        "neg": [r"nu\s+recomand", r"nu\s+merit[ăa]", r"nu\s+e\s+bun", r"nu\s+cump[ăa]ra"],
+        "boundary": True,
+    },
+    "hungarian": {
+        "phrases": [r"aj[aá]nlom", r"meg[eé]ri", r"nagyon j[oó]", r"szuper j[aá]t[eé]k"],
+        "words": [r"szuper", r"fantasztikus", r"kiv[aá]l[oó]", r"nagyon", r"aj[aá]nlani", r"meg[eé]r"],
+        "neg": [r"nem\s+aj[aá]nlom", r"nem\s+[eé]ri\s+meg", r"nem\s+j[oó]", r"ne\s+vedd\s+meg"],
+        "boundary": True,
+    },
+    "bulgarian": {
+        "phrases": [r"препоръч", r"много добра", r"страхотна", r"заслужава си"],
+        "words": [r"страхот", r"отлич", r"супер", r"препоръч", r"шедьовър"],
+        "neg": [r"не\s+препоръч", r"не\s+си\s+струва", r"не\s+е\s+доб", r"не\s+купувай"],
+        "boundary": False,  # кир릴은 \b가 애매해서 단순부분일치로
+    },
+    "greek": {
+        "phrases": [r"το\s+προτείν", r"αξίζει", r"πολύ\s+καλ", r"εξαιρετικ"],
+        "words": [r"τέλει", r"φοβε", r"εξαιρετικ", r"καταπληκτικ", r"προτείν", r"αξίζ"],
+        "neg": [r"δεν\s+προτείν", r"δεν\s+αξίζ", r"δεν\s+είναι\s+καλ", r"μην\s+αγοράσ"],
+        "boundary": False,
+    },
+    "ukrainian": {
+        "phrases": [r"рекоменд", r"дуже\s+хорош", r"варто", r"чудов"],
+        "words": [r"відмін", r"класн", r"шедевр", r"рекоменд", r"варто"],
+        "neg": [r"не\s+рекоменд", r"не\s+варто", r"не\s+хорош", r"не\s+купуй"],
+        "boundary": False,
+    },
+    "russian": {
+        "phrases": [r"рекоменд", r"очень\s+хорош", r"стоит", r"шедевр"],
+        "words": [r"отлич", r"классн", r"супер", r"шедевр", r"рекоменд", r"стоит"],
+        "neg": [r"не\s+рекоменд", r"не\s+стоит", r"плох", r"не\s+покупай", r"не\s+берите"],
+        "boundary": False,
+    },
+    "turkish": {
+        "phrases": [r"kesinlikle tavsiye", r"tavsiye ederim", r"çok iyi", r"mükemmel", r"harika"],
+        "words": [r"güzel", r"mükemmel", r"harika", r"şahane", r"tavsiye", r"değer"],
+        "neg": [r"tavsiye etmem", r"tavsiye etmiyorum", r"iyi değil", r"alma", r"almayın", r"değmez"],
+        "boundary": True,
+    },
+
+    # Korean / Japanese / Chinese / Arabic / Thai / Vietnamese / Indonesian
+    "koreana": {
+        "phrases": [r"강추", r"완전 추천", r"강력 추천", r"갓겜", r"명작", r"존잼", r"개꿀잼", r"재밌", r"재미있"],
+        "words": [r"추천", r"최고", r"꿀잼", r"재미", r"좋다", r"훌륭", r"완벽", r"감동"],
+        "neg": [r"비추", r"추천\s*안", r"추천\s*하지", r"재미없", r"별로", r"최악", r"사지\s*마", r"사지마", r"환불"],
+        "boundary": False,
+    },
+    "japanese": {
+        "phrases": [r"おすすめ", r"オススメ", r"最高", r"神ゲー", r"買う価値", r"面白い", r"楽しい"],
+        "words": [r"おすすめ", r"最高", r"神", r"面白", r"楽しい", r"良い", r"素晴らしい"],
+        "neg": [r"おすすめしない", r"買わない方が", r"つまらない", r"面白くない", r"最悪", r"返品"],
+        "boundary": False,
+    },
+    "schinese": {
+        "phrases": [r"强烈推荐", r"非常推荐", r"值得买", r"值得入", r"很值得", r"很好玩", r"神作", r"精品"],
+        "words": [r"推荐", r"值得", r"好玩", r"很好", r"优秀", r"完美", r"喜欢"],
+        "neg": [r"不推荐", r"不值得", r"不好玩", r"垃圾", r"别买", r"千万别买", r"退款"],
+        "boundary": False,
+    },
+    "tchinese": {
+        "phrases": [r"強烈推薦", r"非常推薦", r"值得買", r"值得入", r"很值得", r"很好玩", r"神作", r"精品"],
+        "words": [r"推薦", r"值得", r"好玩", r"很好", r"優秀", r"完美", r"喜歡"],
+        "neg": [r"不推薦", r"不值得", r"不好玩", r"垃圾", r"別買", r"千萬別買", r"退款"],
+        "boundary": False,
+    },
+    "arabic": {
+        "phrases": [r"أنصح", r"ممتاز", r"رائع", r"يستحق", r"لعبة رائعة", r"ممتعة"],
+        "words": [r"ممتاز", r"رائع", r"جميل", r"ممتع", r"يستحق", r"أنصح"],
+        "neg": [r"لا\s+أنصح", r"لا\s+يستحق", r"سيئ", r"لا\s+تشتري", r"استرجاع"],
+        "boundary": False,
+    },
+    "thai": {
+        "phrases": [r"แนะนำ", r"ดีมาก", r"สุดยอด", r"คุ้มค่า", r"สนุกมาก", r"โคตรสนุก"],
+        "words": [r"แนะนำ", r"ดี", r"สนุก", r"สุดยอด", r"คุ้ม", r"ชอบ"],
+        "neg": [r"ไม่แนะนำ", r"ไม่คุ้ม", r"ไม่ดี", r"แย่", r"อย่าซื้อ", r"ขอคืนเงิน"],
+        "boundary": False,
+    },
+    "vietnamese": {
+        "phrases": [r"rất hay", r"tuyệt vời", r"đáng mua", r"đáng tiền", r"nên mua", r"khuyên dùng"],
+        "words": [r"hay", r"tuyệt", r"xuất sắc", r"đáng", r"thích", r"khuyên", r"nên"],
+        "neg": [r"không\s+khuyên", r"không\s+đáng", r"đừng\s+mua", r"tệ", r"chán", r"hoàn tiền"],
+        "boundary": True,
+    },
+    "indonesian": {
+        "phrases": [r"sangat bagus", r"rekomendasi", r"worth it", r"layak dibeli", r"seru banget"],
+        "words": [r"bagus", r"keren", r"mantap", r"seru", r"rekomend", r"layak"],
+        "neg": [r"tidak\s+rekomend", r"jangan\s+beli", r"tidak\s+layak", r"jelek", r"buruk", r"refund"],
+        "boundary": True,
+    },
+}
+
+# 없는 언어는 english로 fallback
+DEFAULT_LANG = "english"
+
+
+# 2) 정규식 빌더
+def _compile_lexicon(cfg):
+    # 언어 별 \b(단어경계)를 쓸지 말지 결정
+    # 예를 들어 라틴 알파벳 계열은 단어 \b를 써야 bad가 badly 단어에 붙어서 오탐나는거 방지
+    boundary = cfg.get("boundary", True)
+
+    parts_good = []
+    for p in cfg.get("phrases", []):
+        parts_good.append(f"(?:{p})") # ?:...를 사용하는 이유: 정규식에서 ...은 캡처를 만들고, 매칭 결과에 그룹이 저장.
+                                      # ?:...은 그룹화는 하지만 캡처는 안함
+    for w in cfg.get("words", []):    # 저희는 or(|)로 묶어서 패턴을 합치는 목적이라서 캡처가 필요없습니다
+        if boundary:
+            parts_good.append(rf"\b{w}\b")
+        else:
+            parts_good.append(f"(?:{w})")
+
+    good_pat = "|".join(parts_good) if parts_good else r"$^"  #  r"$^"구문은 비어있을 때 매칭 안 되게 막아주는 역할
+    good_re = re.compile(good_pat, flags=re.UNICODE) # 비라틴 문자(한글/중국어/키릴 등) 섞여도 정규식 엔진이 유니코드로 처리
+
+    neg_parts = [f"(?:{p})" for p in cfg.get("neg", [])]
+    neg_pat = "|".join(neg_parts) if neg_parts else r"$^"
+    neg_re = re.compile(neg_pat, flags=re.UNICODE)
+
+    return good_re, neg_re
+
+
+# 미리 컴파일 -> 언어별로 딱 한 번만 컴파일 해두고 재사용하는 방식
+# 데이터가 100만행 단위일 땐, 행마다 컴파일 성능이 크게 떨어지기 때문
+_COMPILED = {}
+for lang, cfg in LEXICON.items():
+    _COMPILED[lang] = _compile_lexicon(cfg)
+_COMPILED[DEFAULT_LANG] = _COMPILED.get(DEFAULT_LANG, _compile_lexicon(LEXICON["english"]))
+
+
+# 3) 멀티언어 good_review 생성 함수
+def add_good_flag_multilang(df, text_col="review", lang_col="language"):
+    out = df.copy() # 원본 df 망가뜨리지 않기 위해 복사본에서 작업
+
+    # casefold: lower보다 더 강한 소문자화(터키어 등)
+    text = out[text_col].fillna("").astype(str).str.casefold()
+    lang = out[lang_col].fillna(DEFAULT_LANG).astype(str)
+
+    good_hit = pd.Series(False, index=out.index) # False 선언: 언어 없는 행이나, 처리 하지 못하는 언어는 안전하게 기본값으로 남기기
+    neg_hit  = pd.Series(False, index=out.index)
+
+    # 언어별 반복문을 행 단위가 아니라 언어 단위로 돌아야함
+    # 예를 들어 100만행을 100만번 도는 방식은 너무 느리기 때문에 언어 종류 수만큼만 반복실행 (예:30개)
+    for l in lang.unique():
+        mask = (lang == l)
+        # 리뷰로 남겨진 언어가 language쪽에 존재하지 않는다면 default로 영어 정규식 사용
+        # 그래서 언어 코드가 예상과 달라도 에러 발생X
+        good_re, neg_re = _COMPILED.get(l, _COMPILED[DEFAULT_LANG])
+
+        # 각 리뷰에서 good_re 패턴이 한번이라도 매칭되면 True
+        good_hit.loc[mask] = text.loc[mask].str.contains(good_re, regex=True)
+        neg_hit.loc[mask]  = text.loc[mask].str.contains(neg_re,  regex=True)
+
+    # 최종 라벨 생성
+    # good 조건을 만족하더라도 neg 조건이 잡히면 good리뷰로 보지 않고 탈락시키는 구문
+    out["good_review"] = (good_hit & (~neg_hit)).astype(int)
+    return out
+
+
+# 4) 적용
+# temp 데이터프레임에 대해 생성
+# 결과로 good_review가 추가된 df 반환
+# 분포 확인은 라벨이 너무 한쪽으로 쏠리는 지 출력으로 확인
+df_good = add_good_flag_multilang(df, text_col="review", lang_col="language")
+print(df_good["good_review"].value_counts())
